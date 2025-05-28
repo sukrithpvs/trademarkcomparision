@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+torch
+torchvision
+opencv-python
+numpy
+jellyfish
+Pillow
+scikit-learn
+easyocr
+matplotlib
+scipy
+pandas
+colormath
+aiofiles
