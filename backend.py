@@ -1,6 +1,6 @@
 import os
 import torch
-import torch.nn.functional as F
+torch.classes.__path__ = []
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
@@ -30,11 +30,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import urllib.parse
 
-# Enhanced CUDA imports
-import cupy as cp
-from numba import cuda
-import math
-
 # Add these new imports for enhanced color analysis
 from colormath.color_objects import sRGBColor, LabColor
 from colormath.color_conversions import convert_color
@@ -43,29 +38,38 @@ from colormath.color_diff import delta_e_cie2000
 # Suppress sklearn convergence warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
+
+
+
+
 app = FastAPI(
     title="CUDA-Accelerated Logo Similarity Ranker API",
-    description="API for ranking logos based on similarity using GPU acceleration",
-    version="2.0.0"
+    description="API for ranking logos based on similarity using CUDA acceleration",
+    version="1.0.0"
 )
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000"],  # React app's default port
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
 )
 app.mount("/static", StaticFiles(directory="/"), name="static")
 
+# Add this endpoint to serve images
 @app.get("/image/{file_path:path}")
 async def get_image(file_path: str):
     """Serve images from file system"""
     try:
+        # Decode URL-encoded path
         decoded_path = urllib.parse.unquote(file_path)
+        
+        # Check if file exists
         if not os.path.exists(decoded_path):
             raise HTTPException(status_code=404, detail="Image not found")
+        
         return FileResponse(decoded_path)
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Image not found: {str(e)}")
@@ -75,9 +79,8 @@ class SimilarityRequest(BaseModel):
     reference_folder_path: str
     comparison_folder_path: str
     infringement_threshold: Optional[float] = 70.0
-    batch_size: Optional[int] = 64  # Increased for GPU
+    batch_size: Optional[int] = 512
     max_images: Optional[int] = 2000
-    use_cuda: Optional[bool] = True
 
 class SimilarityResult(BaseModel):
     logo_path: str
@@ -106,103 +109,43 @@ class AnalysisResponse(BaseModel):
     reference_folder_path: str
     comparison_folder_path: str
 
-# CUDA Kernels for color similarity computation
-@cuda.jit
-def cuda_color_distance_kernel(colors1, colors2, weights1, weights2, distances, n_colors):
-    """CUDA kernel for computing color distances in parallel"""
-    idx = cuda.grid(1)
-    if idx < colors1.shape[0]:
-        total_distance = 0.0
-        total_weight = 0.0
-        
-        for i in range(n_colors):
-            if weights1[idx, i] < 0.05:
-                continue
-                
-            min_delta_e = 1000.0
-            
-            for j in range(n_colors):
-                # Compute LAB distance (simplified)
-                lab1_l, lab1_a, lab1_b = colors1[idx, i, 0], colors1[idx, i, 1], colors1[idx, i, 2]
-                lab2_l, lab2_a, lab2_b = colors2[j, 0], colors2[j, 1], colors2[j, 2]
-                
-                delta_l = lab1_l - lab2_l
-                delta_a = lab1_a - lab2_a
-                delta_b = lab1_b - lab2_b
-                
-                delta_e = math.sqrt(delta_l*delta_l + delta_a*delta_a + delta_b*delta_b)
-                min_delta_e = min(min_delta_e, delta_e)
-            
-            total_distance += min_delta_e * weights1[idx, i]
-            total_weight += weights1[idx, i]
-        
-        if total_weight > 0:
-            distances[idx] = total_distance / total_weight
-        else:
-            distances[idx] = 100.0
-
-@cuda.jit
-def cuda_vit_similarity_kernel(features1, features2, similarities):
-    """CUDA kernel for computing ViT feature similarities"""
-    idx = cuda.grid(1)
-    if idx < features1.shape[0]:
-        dot_product = 0.0
-        norm1 = 0.0
-        norm2 = 0.0
-        
-        for i in range(features1.shape[1]):
-            f1 = features1[idx, i]
-            f2 = features2[i]
-            
-            dot_product += f1 * f2
-            norm1 += f1 * f1
-            norm2 += f2 * f2
-        
-        norm1 = math.sqrt(norm1)
-        norm2 = math.sqrt(norm2)
-        
-        if norm1 > 0 and norm2 > 0:
-            similarities[idx] = dot_product / (norm1 * norm2)
-        else:
-            similarities[idx] = 0.0
-
 class LogoSimilarityRanker:
-    def __init__(self, use_cuda=True):
-        """Initialize the Logo Similarity Ranker with CUDA support"""
-        # Check CUDA availability
-        self.use_cuda = use_cuda and torch.cuda.is_available()
+    def __init__(self):
+        """Initialize the Logo Similarity Ranker with CUDA-optimized components"""
+        # Set device for CUDA acceleration
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
         
-        if self.use_cuda:
-            self.device = torch.device("cuda")
-            print(f"Using CUDA device: {torch.cuda.get_device_name()}")
-            print(f"CUDA version: {torch.version.cuda}")
-            
-            # Set CUDA optimizations
+        # GPU optimizations
+        if torch.cuda.is_available():
+            # Enable optimizations
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.deterministic = False
-        else:
-            self.device = torch.device("cpu")
-            print("Using CPU device")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
+            # Set memory allocation strategy
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
         
         # Initialize OCR engine with GPU support if available
         print('Loading OCR engine...')
-        try:
-            self.reader = easyocr.Reader(['en'], gpu=self.use_cuda)
-            print(f"EasyOCR initialized with GPU: {self.use_cuda}")
-        except Exception as e:
-            print(f"Failed to initialize EasyOCR with GPU, falling back to CPU: {e}")
-            self.reader = easyocr.Reader(['en'], gpu=False)
+        self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
             
-        # Initialize Vision Transformer (ViT) model
+        # Initialize Vision Transformer (ViT) model for deep feature extraction
         print('Loading Vision Transformer model...')
+        # Load pretrained ViT model
         self.vit_model = torchvision.models.vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
         
         # Remove the classification head to get features
         self.vit_model.heads = torch.nn.Identity()
         self.vit_model.eval()
         
-        # Move model to device
+        # Move model to GPU
         self.vit_model = self.vit_model.to(self.device)
+        
+        # Enable mixed precision for faster inference
+        if self.device.type == 'cuda':
+            self.vit_model = self.vit_model.half()
         
         # Define image transformations for ViT
         self.transform = transforms.Compose([
@@ -211,15 +154,39 @@ class LogoSimilarityRanker:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
+        # Warm up GPU
+        if torch.cuda.is_available():
+            dummy_input = torch.randn(1, 3, 224, 224).to(self.device).half()
+            with torch.no_grad():
+                _ = self.vit_model(dummy_input)
+            torch.cuda.empty_cache()
+        
         # Define infringement threshold
         self.infringement_threshold = 70.0
         
-        # CUDA memory management
-        if self.use_cuda:
-            torch.cuda.empty_cache()
+        # Compile CUDA kernels for color processing
+        self._compile_cuda_kernels()
     
-    def extract_text_batch_cuda(self, image_paths, max_workers=8):
-        """Extract text from multiple images in parallel with GPU acceleration"""
+    def _compile_cuda_kernels(self):
+        """Pre-compile CUDA kernels for faster color processing"""
+        if not torch.cuda.is_available():
+            return
+            
+        try:
+            dummy_colors1 = torch.randn(6, 3, device=self.device)
+            dummy_colors2 = torch.randn(6, 3, device=self.device)
+            _ = torch.cdist(dummy_colors1, dummy_colors2)
+            
+            dummy_matrix = torch.randn(1000, 3, device=self.device)
+            _ = torch.norm(dummy_matrix, dim=1)
+            
+            torch.cuda.empty_cache()
+            print("CUDA kernels pre-compiled successfully")
+        except Exception as e:
+            print(f"CUDA kernel compilation warning: {e}")
+    
+    def extract_text_batch(self, image_paths, max_workers=4):
+        """Extract text from multiple images in parallel"""
         def extract_single_text(path):
             try:
                 results = self.reader.readtext(path)
@@ -227,7 +194,6 @@ class LogoSimilarityRanker:
             except:
                 return ""
         
-        # Use more workers for GPU-accelerated OCR
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             texts = list(executor.map(extract_single_text, image_paths))
         
@@ -256,47 +222,53 @@ class LogoSimilarityRanker:
         similarity = (1 - (distance / max_len)) * 100
         return similarity
     
-    def extract_dominant_colors_cuda(self, image_path, n_colors=8):
-        """CUDA-accelerated color extraction"""
+    # NEW: Enhanced strict color extraction
+    def extract_dominant_colors_strict(self, image_path, n_colors=8):
+        """Strict color extraction with better filtering and preprocessing"""
         try:
             image = cv2.imread(image_path)
             if image is None:
                 return np.zeros((n_colors, 3)), np.ones(n_colors) / n_colors
             
-            # Convert to RGB and resize
+            # Convert to RGB
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Resize to larger size for better color representation
             image = cv2.resize(image, (200, 200))
             
-            if self.use_cuda:
-                # Use CuPy for GPU-accelerated image processing
-                image_gpu = cp.asarray(image)
-                
-                # Apply bilateral filter on GPU
-                image_gpu = cp.asarray(cv2.bilateralFilter(cp.asnumpy(image_gpu), 9, 75, 75))
-                
-                # Reshape for clustering
-                pixels_gpu = image_gpu.reshape(-1, 3)
-                
-                # Filter pixels on GPU
-                pixel_sums = cp.sum(pixels_gpu, axis=1)
-                brightness_mask = (pixel_sums > 50) & (pixel_sums < 700)
-                
-                if cp.sum(brightness_mask) > n_colors * 15:
-                    pixels_gpu = pixels_gpu[brightness_mask]
-                
-                # Convert back to CPU for KMeans (scikit-learn doesn't support GPU)
-                pixels = cp.asnumpy(pixels_gpu)
-            else:
-                # CPU fallback
-                image = cv2.bilateralFilter(image, 9, 75, 75)
-                pixels = image.reshape(-1, 3)
-                pixel_sums = pixels.sum(axis=1)
-                brightness_mask = (pixel_sums > 50) & (pixel_sums < 700)
-                
-                if brightness_mask.sum() > n_colors * 15:
-                    pixels = pixels[brightness_mask]
+            # Apply bilateral filter to reduce noise while preserving edges
+            image = cv2.bilateralFilter(image, 9, 75, 75)
             
-            # Perform clustering
+            # Reshape for clustering
+            pixels = image.reshape(-1, 3)
+            
+            # More aggressive filtering to remove background and noise
+            # Remove very dark pixels (likely background)
+            pixel_sums = pixels.sum(axis=1)
+            brightness_mask = (pixel_sums > 50) & (pixel_sums < 700)
+            
+            if brightness_mask.sum() > n_colors * 15:
+                pixels = pixels[brightness_mask]
+            
+            # Convert to HSV for better saturation filtering
+            hsv_pixels = cv2.cvtColor(pixels.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2HSV)
+            saturation = hsv_pixels[:, 0, 1]
+            value = hsv_pixels[:, 0, 2]
+            
+            # Keep only pixels with reasonable saturation and value
+            color_mask = (saturation > 40) & (value > 50)
+            
+            if color_mask.sum() > n_colors * 8:
+                pixels = pixels[color_mask]
+            
+            # Remove grayscale-like colors
+            rgb_std = np.std(pixels, axis=1)
+            color_variation_mask = rgb_std > 15  # Colors with some variation between RGB channels
+            
+            if color_variation_mask.sum() > n_colors * 5:
+                pixels = pixels[color_variation_mask]
+            
+            # Perform clustering with more iterations for better results
             if len(pixels) > n_colors:
                 kmeans = KMeans(
                     n_clusters=n_colors,
@@ -311,16 +283,17 @@ class LogoSimilarityRanker:
                 labels = kmeans.labels_
                 weights = np.bincount(labels, minlength=n_colors) / len(labels)
                 
-                # Sort by weight
+                # Sort by weight (most prominent colors first)
                 sorted_indices = np.argsort(weights)[::-1]
                 colors = colors[sorted_indices]
                 weights = weights[sorted_indices]
                 
                 # Filter out colors with very low weights
-                significant_mask = weights > 0.03
-                if significant_mask.sum() >= 3:
+                significant_mask = weights > 0.03  # At least 3% presence
+                if significant_mask.sum() >= 3:  # Keep at least 3 colors
                     colors = colors[significant_mask]
                     weights = weights[significant_mask]
+                    # Renormalize weights
                     weights = weights / weights.sum()
                     
                     # Pad if necessary
@@ -337,274 +310,72 @@ class LogoSimilarityRanker:
             return colors.astype(np.uint8), weights
             
         except Exception as e:
-            print(f"CUDA color extraction failed: {e}")
+            print(f"Strict color extraction failed: {e}")
             return np.zeros((n_colors, 3)), np.ones(n_colors) / n_colors
     
-    def calculate_color_similarity_cuda_batch(self, ref_colors, ref_weights, batch_colors, batch_weights):
-        """CUDA-accelerated batch color similarity calculation"""
+    # NEW: Batch strict color extraction
+    def extract_dominant_colors_batch_strict(self, image_paths, n_colors=8):
+        """Strict batch color extraction"""
+        def extract_colors_single(path):
+            return self.extract_dominant_colors_strict(path, n_colors)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(extract_colors_single, image_paths))
+        
+        all_colors = [result[0] for result in results]
+        all_weights = [result[1] for result in results]
+        
+        return all_colors, all_weights
+    
+    # NEW: RGB to LAB conversion methods
+    def rgb_to_lab_gpu_batch(self, rgb_colors):
+        """Batch RGB to LAB conversion on GPU using PyTorch"""
         try:
-            if not self.use_cuda:
-                # Fallback to CPU implementation
-                return self.calculate_color_similarity_cpu_batch(ref_colors, ref_weights, batch_colors, batch_weights)
+            # Normalize RGB to 0-1 range
+            rgb_normalized = rgb_colors / 255.0
             
-            batch_size = len(batch_colors)
-            n_colors = len(ref_colors)
-            
-            # Convert to LAB space (simplified for CUDA)
-            ref_lab = self.rgb_to_lab_batch_cuda(ref_colors.reshape(1, -1, 3))
-            batch_lab = self.rgb_to_lab_batch_cuda(np.array(batch_colors))
-            
-            # Prepare CUDA arrays
-            colors1_gpu = cuda.to_device(batch_lab)
-            colors2_gpu = cuda.to_device(ref_lab[0])
-            weights1_gpu = cuda.to_device(np.array(batch_weights))
-            weights2_gpu = cuda.to_device(ref_weights)
-            distances_gpu = cuda.device_array(batch_size, dtype=np.float32)
-            
-            # Launch CUDA kernel
-            threads_per_block = 256
-            blocks_per_grid = (batch_size + threads_per_block - 1) // threads_per_block
-            
-            cuda_color_distance_kernel[blocks_per_grid, threads_per_block](
-                colors1_gpu, colors2_gpu, weights1_gpu, weights2_gpu, distances_gpu, n_colors
+            # Gamma correction
+            mask = rgb_normalized > 0.04045
+            rgb_linear = torch.where(
+                mask,
+                torch.pow((rgb_normalized + 0.055) / 1.055, 2.4),
+                rgb_normalized / 12.92
             )
             
-            # Copy results back to CPU
-            distances = distances_gpu.copy_to_host()
+            # RGB to XYZ transformation matrix
+            transform_matrix = torch.tensor([
+                [0.4124564, 0.3575761, 0.1804375],
+                [0.2126729, 0.7151522, 0.0721750],
+                [0.0193339, 0.1191920, 0.9503041]
+            ], device=self.device, dtype=torch.float32)
             
-            # Convert distances to similarities
-            similarities = []
-            for dist in distances:
-                if dist <= 1:
-                    similarity = 95 - (dist * 5)
-                elif dist <= 3:
-                    similarity = 90 - ((dist - 1) * 20)
-                elif dist <= 6:
-                    similarity = 50 - ((dist - 3) * 10)
-                elif dist <= 10:
-                    similarity = 20 - ((dist - 6) * 4)
-                else:
-                    similarity = max(0, 4 - ((dist - 10) * 0.5))
-                
-                similarities.append(max(0, min(100, similarity)))
+            xyz = torch.matmul(rgb_linear, transform_matrix.T)
             
-            return similarities
+            # Normalize by D65 illuminant
+            d65 = torch.tensor([95.047, 100.000, 108.883], device=self.device, dtype=torch.float32)
+            xyz = xyz / d65
+            
+            # XYZ to LAB
+            mask = xyz > 0.008856
+            f_xyz = torch.where(
+                mask,
+                torch.pow(xyz, 1/3),
+                (7.787 * xyz) + (16/116)
+            )
+            
+            L = (116 * f_xyz[:, 1]) - 16
+            a = 500 * (f_xyz[:, 0] - f_xyz[:, 1])
+            b = 200 * (f_xyz[:, 1] - f_xyz[:, 2])
+            
+            return torch.stack([L, a, b], dim=1)
             
         except Exception as e:
-            print(f"CUDA color similarity failed, falling back to CPU: {e}")
-            return self.calculate_color_similarity_cpu_batch(ref_colors, ref_weights, batch_colors, batch_weights)
-    
-    def rgb_to_lab_batch_cuda(self, rgb_batch):
-        """Convert RGB batch to LAB using CUDA acceleration"""
-        if self.use_cuda:
-            try:
-                # Use CuPy for GPU-accelerated conversion
-                rgb_gpu = cp.asarray(rgb_batch) / 255.0
-                
-                # Simplified RGB to LAB conversion on GPU
-                # This is a simplified version - for production, use proper color space conversion
-                lab_gpu = cp.zeros_like(rgb_gpu)
-                lab_gpu[:, :, 0] = 0.299 * rgb_gpu[:, :, 0] + 0.587 * rgb_gpu[:, :, 1] + 0.114 * rgb_gpu[:, :, 2]  # L
-                lab_gpu[:, :, 1] = rgb_gpu[:, :, 0] - rgb_gpu[:, :, 1]  # a
-                lab_gpu[:, :, 2] = rgb_gpu[:, :, 1] - rgb_gpu[:, :, 2]  # b
-                
-                return cp.asnumpy(lab_gpu * 100)
-            except:
-                pass
-        
-        # CPU fallback
-        lab_batch = []
-        for rgb_image in rgb_batch:
+            print(f"GPU LAB conversion failed: {e}")
+            # Fallback to CPU
             lab_colors = []
-            for rgb_color in rgb_image:
-                lab_colors.append(self.rgb_to_lab_accurate(rgb_color))
-            lab_batch.append(lab_colors)
-        
-        return np.array(lab_batch)
-    
-    def extract_vit_features_batch_cuda(self, image_paths, batch_size=64):
-        """CUDA-accelerated batch ViT feature extraction"""
-        all_features = []
-        
-        # Use larger batch sizes for GPU
-        effective_batch_size = batch_size if self.use_cuda else min(batch_size, 32)
-        
-        for i in range(0, len(image_paths), effective_batch_size):
-            batch_paths = image_paths[i:i + effective_batch_size]
-            batch_tensors = []
-            
-            # Preprocess batch
-            for path in batch_paths:
-                try:
-                    image = Image.open(path).convert('RGB')
-                    tensor = self.transform(image)
-                    batch_tensors.append(tensor)
-                except Exception:
-                    batch_tensors.append(torch.zeros(3, 224, 224))
-            
-            if batch_tensors:
-                # Stack into batch and move to device
-                batch_tensor = torch.stack(batch_tensors).to(self.device)
-                
-                # Extract features for entire batch
-                with torch.no_grad():
-                    if self.use_cuda:
-                        # Use mixed precision for faster inference
-                        with torch.cuda.amp.autocast():
-                            features = self.vit_model(batch_tensor)
-                    else:
-                        features = self.vit_model(batch_tensor)
-                
-                # Convert to CPU and add to results
-                all_features.extend(features.cpu().float().numpy())
-                
-                # Clear GPU cache periodically
-                if self.use_cuda and i % (effective_batch_size * 4) == 0:
-                    torch.cuda.empty_cache()
-        
-        return all_features
-    
-    def calculate_vit_similarity_cuda_batch(self, ref_features, batch_features):
-        """CUDA-accelerated batch ViT similarity calculation"""
-        try:
-            if not self.use_cuda:
-                # CPU fallback
-                similarities = []
-                for features in batch_features:
-                    sim = 1 - cosine(ref_features, features)
-                    similarities.append(sim * 100)
-                return similarities
-            
-            batch_size = len(batch_features)
-            feature_dim = len(ref_features)
-            
-            # Prepare CUDA arrays
-            features1_gpu = cuda.to_device(np.array(batch_features, dtype=np.float32))
-            features2_gpu = cuda.to_device(ref_features.astype(np.float32))
-            similarities_gpu = cuda.device_array(batch_size, dtype=np.float32)
-            
-            # Launch CUDA kernel
-            threads_per_block = 256
-            blocks_per_grid = (batch_size + threads_per_block - 1) // threads_per_block
-            
-            cuda_vit_similarity_kernel[blocks_per_grid, threads_per_block](
-                features1_gpu, features2_gpu, similarities_gpu
-            )
-            
-            # Copy results back to CPU
-            similarities = similarities_gpu.copy_to_host() * 100
-            
-            return similarities.tolist()
-            
-        except Exception as e:
-            print(f"CUDA ViT similarity failed, falling back to CPU: {e}")
-            # CPU fallback
-            similarities = []
-            for features in batch_features:
-                sim = 1 - cosine(ref_features, features)
-                similarities.append(sim * 100)
-            return similarities
-    
-    def calculate_aggregated_scores(self, text_score, image_score):
-        """Calculate final aggregated score based on the specified rules"""
-        if image_score >= 75 and text_score >= 75:
-            final_score = 0.5 * image_score + 0.5 * text_score
-        elif image_score < 25 and text_score < 25:
-            final_score = 0.5 * image_score + 0.5 * text_score
-        elif image_score >= 75 and text_score < 30:
-            final_score = 0.7 * image_score + 0.3 * text_score
-        elif text_score >= 75 and image_score < 30:
-            final_score = 0.3 * image_score + 0.7 * text_score
-        else:
-            final_score = 0.5 * image_score + 0.5 * text_score
-        
-        return final_score
-    
-    def process_logos_batch_cuda(self, reference_logo_path, comparison_paths, batch_size=64):
-        """CUDA-accelerated batch logo processing"""
-        
-        # Extract reference features once
-        ref_vit_features = self.extract_vit_features_batch_cuda([reference_logo_path], 1)[0]
-        ref_colors, ref_weights = self.extract_dominant_colors_cuda(reference_logo_path)
-        ref_text = self.extract_text(reference_logo_path)
-        
-        # Process comparison images in larger batches for GPU
-        all_results = []
-        effective_batch_size = batch_size if self.use_cuda else min(batch_size, 32)
-        
-        for i in range(0, len(comparison_paths), effective_batch_size):
-            batch_paths = comparison_paths[i:i + effective_batch_size]
-            
-            # Batch extract features using CUDA acceleration
-            batch_vit_features = self.extract_vit_features_batch_cuda(batch_paths, effective_batch_size)
-            batch_colors = []
-            batch_weights = []
-            
-            # Extract colors in parallel
-            for path in batch_paths:
-                colors, weights = self.extract_dominant_colors_cuda(path)
-                batch_colors.append(colors)
-                batch_weights.append(weights)
-            
-            batch_texts = self.extract_text_batch_cuda(batch_paths)
-            
-            # Calculate similarities using CUDA
-            color_scores = self.calculate_color_similarity_cuda_batch(
-                ref_colors, ref_weights, batch_colors, batch_weights
-            )
-            vit_scores = self.calculate_vit_similarity_cuda_batch(
-                ref_vit_features, batch_vit_features
-            )
-            
-            # Calculate final scores
-            for j, path in enumerate(batch_paths):
-                try:
-                    # Text similarity
-                    text_score = self.calculate_text_similarity(ref_text, batch_texts[j])
-                    
-                    # Get precomputed scores
-                    color_score = color_scores[j] if j < len(color_scores) else 0.0
-                    vit_score = vit_scores[j] if j < len(vit_scores) else 0.0
-                    
-                    # Calculate image score
-                    image_score = 0.7 * vit_score + 0.3 * color_score
-                    
-                    # Calculate final aggregated score
-                    final_score = self.calculate_aggregated_scores(text_score, image_score)
-                    
-                    result = {
-                        'logo_path': path,
-                        'logo_name': os.path.basename(path),
-                        'text_similarity': text_score,
-                        'color_similarity': color_score,
-                        'vit_similarity': vit_score,
-                        'image_score': image_score,
-                        'final_similarity': final_score,
-                        'infringement_detected': final_score >= self.infringement_threshold,
-                        'text1': ref_text,
-                        'text2': batch_texts[j]
-                    }
-                    
-                    all_results.append(result)
-                    
-                except Exception as e:
-                    print(f"Error processing {path}: {e}")
-                    continue
-            
-            # Clear GPU cache periodically
-            if self.use_cuda:
-                torch.cuda.empty_cache()
-        
-        return all_results
-    
-    # CPU fallback methods
-    def calculate_color_similarity_cpu_batch(self, ref_colors, ref_weights, batch_colors, batch_weights):
-        """CPU fallback for color similarity calculation"""
-        similarities = []
-        for colors, weights in zip(batch_colors, batch_weights):
-            sim = self.calculate_color_similarity_strict(ref_colors, ref_weights, colors, weights)
-            similarities.append(sim)
-        return similarities
+            for color in rgb_colors.cpu().numpy():
+                lab_colors.append(self.rgb_to_lab_accurate(color))
+            return torch.tensor(lab_colors, device=self.device)
     
     def rgb_to_lab_accurate(self, rgb_color):
         """Convert RGB to LAB using colormath library for accuracy"""
@@ -651,22 +422,117 @@ class LogoSimilarityRanker:
         except:
             return np.array([50, 0, 0])
     
+    # NEW: Color family analysis
+    def calculate_color_family_penalty(self, colors1, weights1, colors2, weights2):
+        """Calculate penalty for completely different color families"""
+        try:
+            # Define color families in HSV space
+            def get_color_family(rgb_color):
+                hsv = cv2.cvtColor(np.uint8([[rgb_color]]), cv2.COLOR_RGB2HSV)[0][0]
+                hue = hsv[0]
+                sat = hsv[1]
+                val = hsv[2]
+                
+                # Low saturation = grayscale family
+                if sat < 50:
+                    return 'grayscale'
+                
+                # Color families based on hue
+                if hue < 15 or hue > 165:
+                    return 'red'
+                elif hue < 35:
+                    return 'orange'
+                elif hue < 75:
+                    return 'yellow'
+                elif hue < 105:
+                    return 'green'
+                elif hue < 135:
+                    return 'cyan'
+                else:
+                    return 'blue'
+            
+            # Get dominant color families for each image
+            families1 = {}
+            families2 = {}
+            
+            for color, weight in zip(colors1, weights1):
+                if weight > 0.05:  # Only significant colors
+                    family = get_color_family(color)
+                    families1[family] = families1.get(family, 0) + weight
+            
+            for color, weight in zip(colors2, weights2):
+                if weight > 0.05:  # Only significant colors
+                    family = get_color_family(color)
+                    families2[family] = families2.get(family, 0) + weight
+            
+            # Calculate overlap between color families
+            all_families = set(families1.keys()) | set(families2.keys())
+            overlap = 0
+            
+            for family in all_families:
+                weight1 = families1.get(family, 0)
+                weight2 = families2.get(family, 0)
+                overlap += min(weight1, weight2)
+            
+            # Penalty is inverse of overlap
+            penalty = max(0, 1 - overlap * 2)  # Strong penalty for no overlap
+            
+            return penalty
+            
+        except Exception as e:
+            print(f"Color family penalty calculation failed: {e}")
+            return 0.0
+    
+    # NEW: Strict color similarity calculation
     def calculate_color_similarity_strict(self, colors1, weights1, colors2, weights2):
         """Strict color similarity calculation with proper Delta E thresholds"""
         try:
-            avg_distance_cpu = self.calculate_color_similarity_cpu_strict(colors1, weights1, colors2, weights2)
-            
-            # Strict Delta E to similarity conversion
-            if avg_distance_cpu <= 1:
-                similarity = 95 - (avg_distance_cpu * 5)
-            elif avg_distance_cpu <= 3:
-                similarity = 90 - ((avg_distance_cpu - 1) * 20)
-            elif avg_distance_cpu <= 6:
-                similarity = 50 - ((avg_distance_cpu - 3) * 10)
-            elif avg_distance_cpu <= 10:
-                similarity = 20 - ((avg_distance_cpu - 6) * 4)
+            if torch.cuda.is_available():
+                # GPU-accelerated calculation
+                colors1_gpu = torch.tensor(colors1, dtype=torch.float32, device=self.device)
+                colors2_gpu = torch.tensor(colors2, dtype=torch.float32, device=self.device)
+                weights1_gpu = torch.tensor(weights1, dtype=torch.float32, device=self.device)
+                
+                # Convert to LAB space on GPU
+                lab_colors1 = self.rgb_to_lab_gpu_batch(colors1_gpu)
+                lab_colors2 = self.rgb_to_lab_gpu_batch(colors2_gpu)
+                
+                # Calculate pairwise distances
+                distances = torch.cdist(lab_colors1.unsqueeze(0), lab_colors2.unsqueeze(0)).squeeze(0)
+                
+                # Find minimum distances for each significant color
+                min_distances, _ = torch.min(distances, dim=1)
+                
+                # Only consider colors with significant presence
+                significant_mask = weights1_gpu >= 0.05
+                
+                if torch.sum(significant_mask) > 0:
+                    weighted_distances = min_distances[significant_mask] * weights1_gpu[significant_mask]
+                    total_weight = torch.sum(weights1_gpu[significant_mask])
+                    avg_distance = torch.sum(weighted_distances) / total_weight
+                else:
+                    avg_distance = torch.tensor(100.0, device=self.device)
+                
+                avg_distance_cpu = avg_distance.cpu().item()
             else:
-                similarity = max(0, 4 - ((avg_distance_cpu - 10) * 0.5))
+                # CPU fallback
+                avg_distance_cpu = self.calculate_color_similarity_cpu_strict(colors1, weights1, colors2, weights2)
+            
+            # Much stricter Delta E to similarity conversion
+            if avg_distance_cpu <= 1:
+                similarity = 95 - (avg_distance_cpu * 5)  # 95% to 90%
+            elif avg_distance_cpu <= 3:
+                similarity = 90 - ((avg_distance_cpu - 1) * 20)  # 90% to 50%
+            elif avg_distance_cpu <= 6:
+                similarity = 50 - ((avg_distance_cpu - 3) * 10)  # 50% to 20%
+            elif avg_distance_cpu <= 10:
+                similarity = 20 - ((avg_distance_cpu - 6) * 4)  # 20% to 4%
+            else:
+                similarity = max(0, 4 - ((avg_distance_cpu - 10) * 0.5))  # 4% to 0%
+            
+            # Additional penalty for completely different color families
+            penalty = self.calculate_color_family_penalty(colors1, weights1, colors2, weights2)
+            similarity = similarity * (1 - penalty)
             
             return max(0, min(100, similarity))
             
@@ -695,7 +561,7 @@ class LogoSimilarityRanker:
             
             # Calculate distances for significant colors only
             for i, (lab1, weight1) in enumerate(zip(lab_colors1, weights1)):
-                if weight1 < 0.05:
+                if weight1 < 0.05:  # Skip insignificant colors
                     continue
                 
                 min_delta_e = float('inf')
@@ -721,6 +587,224 @@ class LogoSimilarityRanker:
         except Exception as e:
             print(f"CPU strict color similarity failed: {e}")
             return 100.0
+    
+    # Keep the old method for backward compatibility
+    def extract_dominant_colors_fast(self, image_paths, n_colors=5):
+        """Fast batch color extraction using optimized approach"""
+        all_colors = []
+        
+        for path in image_paths:
+            try:
+                image = cv2.imread(path)
+                if image is None:
+                    all_colors.append(np.zeros((n_colors, 3)))
+                    continue
+                    
+                # Resize for faster processing
+                image = cv2.resize(image, (64, 64))
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                
+                # Use histogram-based approach instead of KMeans for speed
+                pixels = image.reshape(-1, 3)
+                
+                # Simple quantization approach
+                quantized = (pixels // 32) * 32  # Quantize to reduce unique colors
+                unique_colors, counts = np.unique(quantized, axis=0, return_counts=True)
+                
+                # Get top colors by frequency
+                sorted_indices = np.argsort(counts)[::-1]
+                top_colors = unique_colors[sorted_indices[:n_colors]]
+                
+                # Pad if necessary
+                colors = np.zeros((n_colors, 3))
+                colors[:len(top_colors)] = top_colors
+                all_colors.append(colors)
+            except Exception:
+                all_colors.append(np.zeros((n_colors, 3)))
+        
+        return all_colors
+    
+    def extract_dominant_colors(self, image_path, n_colors=5):
+        """Extract dominant colors from the logo using optimized approach"""
+        try:
+            image = cv2.imread(image_path)
+            if image is None:
+                return np.zeros((n_colors, 3))
+                
+            # Resize for faster processing
+            image = cv2.resize(image, (64, 64))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Use histogram-based approach for speed
+            pixels = image.reshape(-1, 3)
+            quantized = (pixels // 32) * 32
+            unique_colors, counts = np.unique(quantized, axis=0, return_counts=True)
+            
+            sorted_indices = np.argsort(counts)[::-1]
+            top_colors = unique_colors[sorted_indices[:n_colors]]
+            
+            colors = np.zeros((n_colors, 3))
+            colors[:len(top_colors)] = top_colors
+            
+            return colors
+        except Exception:
+            return np.zeros((n_colors, 3))
+    
+    def calculate_color_similarity(self, colors1, colors2):
+        """Calculate similarity between two sets of dominant colors using vectorized operations"""
+        try:
+            colors1 = np.array(colors1)
+            colors2 = np.array(colors2)
+            
+            distances = np.linalg.norm(colors1[:, np.newaxis] - colors2[np.newaxis, :], axis=2)
+            min_distances = np.min(distances, axis=1)
+            avg_distance = np.mean(min_distances)
+            
+            max_distance = 255 * np.sqrt(3)
+            similarity = (1 - (avg_distance / max_distance)) * 100
+            
+            return similarity
+        except Exception:
+            return 0.0
+    
+    def extract_vit_features_batch(self, image_paths, batch_size=512):
+        """Extract features from multiple images in batches for maximum GPU utilization"""
+        all_features = []
+        
+        for i in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[i:i + batch_size]
+            batch_tensors = []
+            
+            # Preprocess batch on CPU
+            for path in batch_paths:
+                try:
+                    image = Image.open(path).convert('RGB')
+                    tensor = self.transform(image)
+                    batch_tensors.append(tensor)
+                except Exception:
+                    # Use zero tensor for failed images
+                    batch_tensors.append(torch.zeros(3, 224, 224))
+            
+            if batch_tensors:
+                # Stack into batch and move to GPU
+                batch_tensor = torch.stack(batch_tensors).to(self.device)
+                
+                if self.device.type == 'cuda':
+                    batch_tensor = batch_tensor.half()
+                
+                # Extract features for entire batch
+                with torch.no_grad():
+                    if self.device.type == 'cuda':
+                        with torch.amp.autocast("cuda"):
+                            features = self.vit_model(batch_tensor)
+                    else:
+                        features = self.vit_model(batch_tensor)
+                
+                # Convert to CPU and add to results
+                all_features.extend(features.cpu().float().numpy())
+        
+        return all_features
+    
+    def extract_vit_features(self, image_path):
+        """Extract deep features from the logo using CUDA-accelerated Vision Transformer"""
+        try:
+            image = Image.open(image_path).convert('RGB')
+            image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+            
+            if self.device.type == 'cuda':
+                image_tensor = image_tensor.half()
+            
+            with torch.no_grad():
+                if self.device.type == 'cuda':
+                    with torch.amp.autocast("cuda"):
+                        features = self.vit_model(image_tensor)
+                else:
+                    features = self.vit_model(image_tensor)
+            
+            return features.cpu().float().numpy().flatten()
+        except Exception:
+            return np.zeros(768)
+    
+    def calculate_aggregated_scores(self, text_score, image_score):
+        """Calculate final aggregated score based on the specified rules"""
+        # Rule 1: If both image score and text score are above 75%
+        if image_score >= 75 and text_score >= 75:
+            final_score = 0.5 * image_score + 0.5 * text_score
+        # Rule 2: If both image score and text score are less than 25%
+        elif image_score < 25 and text_score < 25:
+            final_score = 0.5 * image_score + 0.5 * text_score
+        # Rule 3: If image score is above 75 and text score is less than 30
+        elif image_score >= 75 and text_score < 30:
+            final_score = 0.7 * image_score + 0.3 * text_score
+        # Rule 3 (vice versa): If text score is above 75 and image score is less than 30
+        elif text_score >= 75 and image_score < 30:
+            final_score = 0.3 * image_score + 0.7 * text_score
+        # Default case: equal weighting
+        else:
+            final_score = 0.5 * image_score + 0.5 * text_score
+        
+        return final_score
+    
+    # UPDATED: Process logos batch with strict color analysis
+    def process_logos_batch(self, reference_logo_path, comparison_paths, batch_size=512):
+        """Process multiple logos efficiently using batch operations with strict color analysis"""
+        
+        # Extract reference features once using strict method
+        ref_vit_features = self.extract_vit_features(reference_logo_path)
+        ref_colors, ref_weights = self.extract_dominant_colors_strict(reference_logo_path)
+        ref_text = self.extract_text(reference_logo_path)
+        
+        # Process comparison images in batches
+        all_results = []
+        
+        for i in range(0, len(comparison_paths), batch_size):
+            batch_paths = comparison_paths[i:i + batch_size]
+            
+            # Batch extract features using strict methods
+            batch_vit_features = self.extract_vit_features_batch(batch_paths, batch_size)
+            batch_colors, batch_weights = self.extract_dominant_colors_batch_strict(batch_paths)
+            batch_texts = self.extract_text_batch(batch_paths)
+            
+            # Calculate similarities for batch
+            for j, path in enumerate(batch_paths):
+                try:
+                    # Text similarity
+                    text_score = self.calculate_text_similarity(ref_text, batch_texts[j])
+                    
+                    # Strict color similarity
+                    color_score = self.calculate_color_similarity_strict(
+                        ref_colors, ref_weights, batch_colors[j], batch_weights[j]
+                    )
+                    
+                    # ViT similarity
+                    vit_sim = 1 - cosine(ref_vit_features, batch_vit_features[j])
+                    vit_score = vit_sim * 100
+                    
+                    # Calculate image score (60% ViT + 40% Color for better color influence)
+                    image_score = 0.7 * vit_score + 0.3 * color_score
+                    
+                    # Calculate final aggregated score using the new rules
+                    final_score = self.calculate_aggregated_scores(text_score, image_score)
+                    
+                    result = {
+                        'logo_path': path,
+                        'logo_name': os.path.basename(path),
+                        'text_similarity': text_score,
+                        'color_similarity': color_score,
+                        'vit_similarity': vit_score,
+                        'image_score': image_score,
+                        'final_similarity': final_score,
+                        'infringement_detected': final_score >= self.infringement_threshold,
+                        'text1': ref_text,
+                        'text2': batch_texts[j]
+                    }
+                    
+                    all_results.append(result)
+                    
+                except Exception:
+                    continue
+        
+        return all_results
 
 def get_image_files_from_folder(folder_path):
     """Get all image files from a folder"""
@@ -740,60 +824,69 @@ async def startup_event():
     """Initialize the ranker on startup"""
     global ranker
     print("Initializing CUDA-accelerated Logo Similarity Ranker...")
-    ranker = LogoSimilarityRanker(use_cuda=True)
+    ranker = LogoSimilarityRanker()
     print("Ranker initialized successfully!")
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
-    cuda_available = torch.cuda.is_available()
-    device_name = torch.cuda.get_device_name() if cuda_available else "CPU"
+    cuda_status = "enabled" if torch.cuda.is_available() else "disabled"
+    gpu_info = {}
+    
+    if torch.cuda.is_available():
+        gpu_info = {
+            "gpu_name": torch.cuda.get_device_name(),
+            "gpu_memory_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
+        }
     
     return {
-        "message": "CUDA-accelerated Logo Similarity Ranker API",
-        "version": "2.0.0",
-        "cuda_available": cuda_available,
-        "device": device_name,
-        "processing_mode": "GPU" if cuda_available else "CPU",
+        "message": "CUDA-Accelerated Logo Similarity Ranker API with Strict Color Analysis",
+        "version": "1.0.0",
+        "cuda_status": cuda_status,
+        "gpu_info": gpu_info,
         "features": [
-            "CUDA-accelerated color comparison",
-            "GPU-optimized ViT feature extraction",
-            "Parallel batch processing",
-            "Mixed precision inference",
-            "CuPy acceleration for image processing"
+            "Strict Delta E color comparison",
+            "Color family analysis",
+            "GPU-accelerated processing",
+            "Enhanced color filtering"
         ],
         "endpoints": {
-            "/analyze": "POST - Analyze logo similarity with GPU acceleration",
-            "/health": "GET - Health check with GPU status"
+            "/analyze": "POST - Analyze logo similarity for multiple reference images",
+            "/health": "GET - Health check",
+            "/cuda-stats": "GET - CUDA statistics (if available)"
         }
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint with GPU status"""
-    cuda_available = torch.cuda.is_available()
-    gpu_memory = None
-    
-    if cuda_available:
-        gpu_memory = {
-            "allocated": torch.cuda.memory_allocated() / 1024**2,  # MB
-            "cached": torch.cuda.memory_reserved() / 1024**2,  # MB
-            "total": torch.cuda.get_device_properties(0).total_memory / 1024**2  # MB
-        }
-    
+    """Health check endpoint"""
     return {
         "status": "healthy",
-        "cuda_available": cuda_available,
-        "device": torch.cuda.get_device_name() if cuda_available else "CPU",
-        "gpu_memory_mb": gpu_memory,
-        "ranker_initialized": ranker is not None,
-        "processing_mode": "GPU" if cuda_available else "CPU"
+        "cuda_available": torch.cuda.is_available(),
+        "ranker_initialized": ranker is not None
+    }
+
+@app.get("/cuda-stats")
+async def cuda_stats():
+    """Get CUDA statistics"""
+    if not torch.cuda.is_available():
+        raise HTTPException(status_code=400, detail="CUDA not available")
+    
+    return {
+        "gpu_utilization_percent": torch.cuda.utilization(),
+        "memory_allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
+        "memory_cached_gb": round(torch.cuda.memory_reserved() / 1e9, 2),
+        "device_name": torch.cuda.get_device_name(),
+        "device_count": torch.cuda.device_count()
     }
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_logos(request: SimilarityRequest):
     """
-    Analyze logo similarity with CUDA acceleration
+    Analyze logo similarity for multiple reference images against comparison logos
+    
+    This endpoint processes all images in the reference folder one by one,
+    comparing each against all images in the comparison folder using strict color analysis.
     """
     global ranker
     
@@ -820,7 +913,7 @@ async def analyze_logos(request: SimilarityRequest):
     # Update ranker settings
     ranker.infringement_threshold = request.infringement_threshold
     
-    # Limit images to process
+    # Limit images to process with proper warnings
     if len(reference_images) > request.max_images:
         print(f"Warning: Reference folder contains {len(reference_images)} images, limiting to {request.max_images}")
         reference_images = reference_images[:request.max_images]
@@ -829,8 +922,7 @@ async def analyze_logos(request: SimilarityRequest):
         print(f"Warning: Comparison folder contains {len(comparison_images)} images, limiting to {request.max_images}")
         comparison_images = comparison_images[:request.max_images]
     
-    processing_mode = "GPU" if ranker.use_cuda else "CPU"
-    print(f"Processing {len(reference_images)} reference images against {len(comparison_images)} comparison images with {processing_mode}")
+    print(f"Processing {len(reference_images)} reference images against {len(comparison_images)} comparison images with strict color analysis")
     
     # Process each reference image
     batch_results = []
@@ -842,14 +934,14 @@ async def analyze_logos(request: SimilarityRequest):
         batch_start_time = time.time()
         
         try:
-            # Process this reference image against all comparison images using CUDA
-            similarity_results = ranker.process_logos_batch_cuda(
+            # Process this reference image against all comparison images using strict analysis
+            similarity_results = ranker.process_logos_batch(
                 ref_image_path,
                 comparison_images,
                 batch_size=request.batch_size
             )
             
-            # Sort results by final similarity
+            # Sort results by final similarity (highest to lowest)
             similarity_results.sort(key=lambda x: x['final_similarity'], reverse=True)
             
             batch_processing_time = time.time() - batch_start_time
@@ -870,6 +962,10 @@ async def analyze_logos(request: SimilarityRequest):
             )
             
             batch_results.append(batch_result)
+            
+            # Clear GPU cache periodically
+            if torch.cuda.is_available() and i % 2 == 0:
+                torch.cuda.empty_cache()
                 
         except Exception as e:
             print(f"Error processing reference image {ref_image_path}: {str(e)}")
@@ -888,10 +984,12 @@ async def analyze_logos(request: SimilarityRequest):
         "avg_processing_time_per_reference": round(avg_processing_time, 2),
         "images_per_second": round(total_comparisons / total_processing_time, 1) if total_processing_time > 0 else 0,
         "infringement_rate_percent": round((total_infringements / total_comparisons) * 100, 2) if total_comparisons > 0 else 0,
-        "analysis_method": f"{processing_mode}-accelerated with CUDA kernels",
-        "device_used": torch.cuda.get_device_name() if ranker.use_cuda else "CPU",
-        "cuda_available": torch.cuda.is_available()
+        "analysis_method": "Strict Color Analysis with Delta E"
     }
+    
+    # Final GPU cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     return AnalysisResponse(
         total_reference_images=len(reference_images),
@@ -903,6 +1001,16 @@ async def analyze_logos(request: SimilarityRequest):
         comparison_folder_path=request.comparison_folder_path
     )
 
+@app.post("/clear-gpu-cache")
+async def clear_gpu_cache():
+    """Clear GPU cache"""
+    if not torch.cuda.is_available():
+        raise HTTPException(status_code=400, detail="CUDA not available")
+    
+    torch.cuda.empty_cache()
+    return {"message": "GPU cache cleared successfully"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
