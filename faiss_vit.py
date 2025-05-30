@@ -157,7 +157,7 @@ class MemoryEfficientFAISSIndex:
     def optimize_faiss_threading(self):
         """Set optimal FAISS threading based on system"""
         cpu_count = os.cpu_count()
-        optimal_threads = min(4, cpu_count // 2)
+        optimal_threads = 10
         
         os.environ['OMP_NUM_THREADS'] = str(optimal_threads)
         os.environ['OMP_WAIT_POLICY'] = 'PASSIVE'
@@ -283,8 +283,9 @@ class MemoryEfficientFAISSIndex:
         normalized_query = query_vector / np.linalg.norm(query_vector)
         query_array = np.array([normalized_query]).astype('float32')
         
-        # Limit search results for performance
-        effective_k = min(k, self.index.ntotal, 100)
+        
+        effective_k = min(k, self.index.ntotal)
+
         
         # Search
         scores, indices = self.index.search(query_array, effective_k)
