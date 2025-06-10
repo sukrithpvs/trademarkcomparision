@@ -1,0 +1,7 @@
+/logos
+/ocr_cache
+/sift_cache
+/logo_cache
+/.env/
+/extracted_logos
+/__pycache__/
