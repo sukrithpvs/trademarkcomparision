@@ -132,10 +132,22 @@ def calculate_similarity_advanced(text1, text2):
         return i
 
     def preprocess_text(text):
+        """Preprocesses text by converting to lowercase and removing duplicate words."""
         if text is None:
             return ""
-        text = str(text).strip()
-        return ' '.join(text.split())
+        # Convert to lowercase and strip leading/trailing whitespace
+        text = str(text).lower().strip()
+        
+        # Split into words
+        words = text.split()
+        
+        # Get unique words while preserving order (e.g., "a b a" -> "a b")
+        if not words:
+            return ""
+        unique_words = list(dict.fromkeys(words))
+        
+        # Join back into a single string
+        return ' '.join(unique_words)
 
     def calculate_character_overlap(w1, w2):
         """Calculate character overlap percentage"""
@@ -225,7 +237,7 @@ def calculate_similarity_advanced(text1, text2):
                 min_word_len = min(len(w1), len(w2))
                 prefix_sim = (prefix_len / min_word_len) * 70
                 current_sim = max(current_sim, prefix_sim)
-
+            
             # Enhanced Levenshtein for shorter words
             if 3 <= len(w1) <= 10 and 3 <= len(w2) <= 10:
                 lev_dist = jellyfish.levenshtein_distance(w1, w2)
@@ -272,11 +284,15 @@ def debug_similarity_calculation(text1, text2):
     
     cleaned1 = clean_extracted_text(text1)
     cleaned2 = clean_extracted_text(text2)
+
+    # Show preprocessing steps for debug
+    preprocessed1 = calculate_similarity_advanced.__closure__[2].cell_contents(cleaned1)
+    preprocessed2 = calculate_similarity_advanced.__closure__[2].cell_contents(cleaned2)
     
     print(f"🔍 DEBUG: Cleaned text1: {repr(cleaned1)}")
+    print(f"🔍 DEBUG: Preprocessed text1 (lower, unique): {repr(preprocessed1)}")
     print(f"🔍 DEBUG: Cleaned text2: {repr(cleaned2)}")
-    print(f"🔍 DEBUG: Text1 is empty: {not cleaned1}")
-    print(f"🔍 DEBUG: Text2 is empty: {not cleaned2}")
+    print(f"🔍 DEBUG: Preprocessed text2 (lower, unique): {repr(preprocessed2)}")
     
     similarity = calculate_similarity_advanced(text1, text2)
     print(f"🔍 DEBUG: Final similarity: {similarity}")
